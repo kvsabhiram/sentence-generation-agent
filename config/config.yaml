@@ -1,0 +1,87 @@
+# Synthetic Sentence Pipeline configuration
+
+llm:
+  generator:
+    provider: gemini
+    model: gemini-3.6-flash
+    temperature: 0.9
+    max_output_tokens: 16384
+  judge:
+    # Both Gemini keys (generator + judge) ran out of prepayment credits.
+    # OpenAI still has a working balance, so the judge is back on OpenAI for
+    # now -- switchable via this one field (agents/judge.py dispatches on
+    # it; see agents/judge_gemini.py / agents/judge_openai.py).
+    provider: openai
+    model: gpt-5.6-luna
+    # OpenAI's newer reasoning-tier models reject any non-default temperature
+    # (only 1 is accepted) -- leave null so agents/judge_openai.py omits the
+    # parameter entirely rather than risk a rejected request.
+    temperature: null
+    # The replay's merged candidate pool (up to 10 sentences/word, both
+    # generation rounds combined) makes chunks ~2x bigger than a normal
+    # single-round judge chunk. At that size, reasoning alone consumed the
+    # full 16384 before any visible output -- confirmed live against a real
+    # failing chunk: 32768 succeeded with room to spare (used ~28.7K).
+    max_output_tokens: 32768
+  embedding:
+    provider: local
+    model: sentence-transformers/all-MiniLM-L6-v2
+
+pipeline:
+  batch_size: 25
+  sentences_requested_per_word: 5
+  min_passing_sentences_per_word: 3
+  max_generation_rounds: 3          # 1 initial pass + backfill retries
+  near_duplicate_similarity_threshold: 0.92
+  # OpenAI's batch API rejects a job outright if its requests' reserved
+  # tokens (prompt + max_output_tokens, summed) would exceed the org's
+  # enqueued-token cap for that model (2,000,000 on this account) -- the
+  # rejection is immediate and total, not partial. Judge work is split into
+  # sub-jobs of at most this many chunks, run judge_max_concurrent_jobs at a
+  # time (see below) -- their COMBINED reserved tokens must stay under the
+  # cap. At ~14,000 prompt (merged-pool chunks run larger) + 32,768
+  # max_output tokens/chunk, 14 chunks/job x 2 concurrent jobs reserves
+  # ~1.31M tokens total, comfortably under the cap with the same margin as
+  # the previous single-job-of-28 approach.
+  # NOTE: if judge provider is switched back to gemini, or once a round is
+  # judging single-round (non-merged) chunks again, this can go higher.
+  judge_batch_job_max_chunks: 14
+  # How many judge batch jobs run concurrently. OpenAI's batch queue seems to
+  # process jobs opportunistically against spare capacity -- submitting job
+  # N+1 only after job N fully finishes (the old behavior) leaves that
+  # capacity idle whenever the backend could have run both at once. Raise
+  # this (and lower judge_batch_job_max_chunks proportionally to keep the
+  # combined reservation under the cap) if OpenAI's queue tolerates more.
+  judge_max_concurrent_jobs: 2
+
+paths:
+  input_file: input/merged_dataset_total_words.csv
+  prompts_dir: prompts
+  data_raw: data/raw
+  data_processed: data/processed
+  data_rejected: data/rejected
+  data_final: data/final
+  logs_dir: logs
+  state_file: data/state.json
+
+# Judge decision thresholds. These are enforced deterministically by
+# pipeline/validation.py from the judge's per-dimension scores -- the
+# judge's own self-reported "decision" field is logged for audit only
+# and is never trusted as the source of truth.
+judge_thresholds:
+  target_usage: 0.90
+  grammar: 0.85
+  naturalness: 0.85
+  domain_relevance: 0.80
+  category_relevance: 0.80
+  context_quality: 0.80
+  training_usefulness: 0.85
+
+retry:
+  max_api_attempts: 4
+  base_backoff_seconds: 2.0
+  max_backoff_seconds: 30.0
+
+logging:
+  level: INFO
+  file: pipeline.log
