@@ -5,23 +5,24 @@ Designed to be safely interruptible and resumable at 15k+ word scale: state is
 checkpointed to disk after every phase (pipeline/state.py), and only words
 still short of their passing-sentence quota are re-processed on a re-run.
 
-Generation runs on Gemini's async Batch Mode (~50% cheaper than synchronous
-calls, proven fast/reliable at 620-chunk scale) -- one batch job per round,
-covering every chunk at once rather than one job per chunk (submitting
-per-chunk would pay the job-startup overhead hundreds of times over). Judging
-is provider-switchable (agents/judge.py dispatches on config.yaml's
-llm.judge.provider) and runs as a pool of up to judge_max_concurrent_jobs
-batch jobs at a time, refilled from a queue as jobs finish -- sized so the
-pool's *combined* reserved tokens stay under whichever provider's org-wide
-quota applies (OpenAI enforces one; Gemini hasn't hit one yet but the same
-safety margin is kept regardless of provider).
+Both generation and judging are provider-switchable (agents/generator.py and
+agents/judge.py each dispatch on config.yaml's llm.<agent>.provider) and each
+run as a pool of up to <agent>_max_concurrent_jobs batch jobs at a time,
+refilled from a queue as jobs finish -- sized so the pool's *combined*
+reserved tokens stay under whichever provider's org-wide quota applies
+(OpenAI enforces one; Gemini hasn't hit one yet but the same safety margin is
+kept regardless of provider, since either agent may run on either provider).
+Both providers' credit balances have run dry at different points during this
+project, which is exactly the scenario this design exists to survive.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import yaml
 from dotenv import load_dotenv
@@ -315,23 +316,17 @@ def _drain_judge_queue(
             time.sleep(poll_interval_seconds)
 
 
-def _finish_generation_batch(
-    job_name: str,
+def _apply_generation_results(
     word_batches: list[list[dict]],
+    results_by_chunk_id: dict[str, list[dict]],
     state: PipelineState,
     paths: dict,
     embedding_model: str,
     similarity_threshold: float,
 ) -> list[list[dict]]:
-    """Waits for a generation batch job, then runs local validation/dedup on
-    every chunk's results. Returns the judge-ready chunks (empty chunks, i.e.
-    words with nothing surviving, are simply omitted)."""
-    logger.info("waiting for generation batch job %s (%d chunk(s))...", job_name, len(word_batches))
-    final_job = generator.poll_generation_batch_job(job_name, poll_interval_seconds=30)
-    if final_job.state.name != "JOB_STATE_SUCCEEDED":
-        logger.error("generation batch job %s ended with state=%s; affected words stay pending", job_name, final_job.state)
-    results_by_chunk_id = generator.fetch_generation_batch_results(final_job, word_batches)
-
+    """Runs local validation/dedup on one generation job's results. Returns
+    the judge-ready chunks (empty chunks, i.e. words with nothing surviving,
+    are simply omitted)."""
     judge_chunks: list[list[dict]] = []
     for i, batch in enumerate(word_batches):
         gen_results = results_by_chunk_id.get(str(i))
@@ -348,8 +343,81 @@ def _finish_generation_batch(
         if judge_chunk:
             judge_chunks.append(judge_chunk)
         state.save()
-
     return judge_chunks
+
+
+def _drain_generation_queue(
+    config: dict,
+    prompts_dir: str,
+    state: PipelineState,
+    paths: dict,
+    embedding_model: str,
+    similarity_threshold: float,
+    max_concurrent: int = 1,
+    poll_interval_seconds: int = 30,
+) -> list[list[dict]]:
+    """Generation-side counterpart to _drain_judge_queue: runs a pool of up to
+    `max_concurrent` generation batch jobs at once, refilled from
+    state's generation_queue as jobs finish, until the queue is empty and
+    nothing is left in flight. Returns the combined judge-ready chunks from
+    every job that finished. See _drain_judge_queue for the full rationale
+    (concurrency against opportunistic batch-queue capacity; combined
+    reserved-token budget kept under whichever provider's org-wide quota
+    applies)."""
+    legacy = state.get_pending_generation_batch()
+    if legacy:
+        provider = legacy.get("provider", config["llm"]["generator"]["provider"])
+        state.add_pending_generation_batch(legacy["job_name"], legacy["chunks"], provider)
+        state.clear_pending_generation_batch()
+
+    max_chunks_per_job = config["pipeline"]["generation_batch_job_max_chunks"]
+    max_total_chunks_in_flight = max_chunks_per_job * max_concurrent
+
+    all_judge_chunks: list[list[dict]] = []
+    while True:
+        pending = state.get_pending_generation_batches()
+        chunks_in_flight = sum(len(p["chunks"]) for p in pending)
+
+        while len(pending) < max_concurrent:
+            sub_batch = state.pop_generation_queue_item()
+            if sub_batch is None:
+                break
+            if pending and chunks_in_flight + len(sub_batch) > max_total_chunks_in_flight:
+                state.push_generation_queue_item_front(sub_batch)
+                break
+            try:
+                provider = config["llm"]["generator"]["provider"]
+                job_name = generator.submit_generation_batch_job(sub_batch, config, prompts_dir)
+            except Exception:
+                logger.exception(
+                    "failed to submit generation sub-batch (%d chunks); returning it to the queue for retry", len(sub_batch),
+                )
+                state.push_generation_queue_item_front(sub_batch)
+                break
+            state.add_pending_generation_batch(job_name, sub_batch, provider)
+            pending = state.get_pending_generation_batches()
+            chunks_in_flight += len(sub_batch)
+
+        if not pending:
+            return all_judge_chunks
+
+        any_finished = False
+        for p in pending:
+            job = generator.check_batch_status(p["job_name"], p["provider"])
+            if not generator.is_terminal(job, p["provider"]):
+                continue
+            any_finished = True
+            if not generator.is_batch_successful(job, p["provider"]):
+                logger.error("generation batch job %s did not succeed; affected words stay pending", p["job_name"])
+            results_by_chunk_id = generator.fetch_generation_batch_results(job, p["chunks"], p["provider"])
+            judge_chunks = _apply_generation_results(
+                p["chunks"], results_by_chunk_id, state, paths, embedding_model, similarity_threshold,
+            )
+            all_judge_chunks.extend(judge_chunks)
+            state.remove_pending_generation_batch(p["job_name"])
+
+        if not any_finished:
+            time.sleep(poll_interval_seconds)
 
 
 def export_final(all_records: list[dict], state: PipelineState, paths: dict) -> None:
@@ -368,26 +436,35 @@ def export_final(all_records: list[dict], state: PipelineState, paths: dict) -> 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def _complete_pending_generation_raw_log(state: PipelineState, paths: dict) -> None:
-    """If a generation batch job is still tracked as pending, poll it (read-only
-    against Gemini -- no new request submitted, no new spend) and flush its raw
-    output to disk without running validation/dedup yet. Used by
-    replay_from_raw() so an already-submitted, already-paid-for job's results
-    get captured without triggering any *new* Gemini API usage."""
-    pending_gen = state.get_pending_generation_batch()
-    if not pending_gen:
-        return
-    job_name = pending_gen["job_name"]
-    word_batches = pending_gen["chunks"]
-    logger.info("polling existing generation batch job %s to complete the raw log (read-only, no new requests)...", job_name)
-    final_job = generator.poll_generation_batch_job(job_name, poll_interval_seconds=30)
-    if final_job.state.name != "JOB_STATE_SUCCEEDED":
-        logger.error("generation batch job %s ended with state=%s; some words may be missing this round's data", job_name, final_job.state)
-    results_by_chunk_id = generator.fetch_generation_batch_results(final_job, word_batches)
-    for i, batch in enumerate(word_batches):
-        gen_results = results_by_chunk_id.get(str(i))
-        if gen_results is not None:
-            jsonl_storage.append_jsonl(paths["raw"], gen_results)
+def _complete_pending_generation_raw_log(state: PipelineState, paths: dict, config: dict) -> None:
+    """If a generation batch job is still tracked as pending (legacy single-job
+    form, or the new pool form), poll it (read-only -- no new request
+    submitted, no new spend) and flush its raw output to disk without running
+    validation/dedup yet. Used by replay_from_raw() so an already-submitted,
+    already-paid-for job's results get captured without triggering any *new*
+    generation API usage."""
+    jobs = []
+    legacy = state.get_pending_generation_batch()
+    if legacy:
+        provider = legacy.get("provider", config["llm"]["generator"]["provider"])
+        jobs.append((legacy["job_name"], legacy["chunks"], provider))
+    for p in state.get_pending_generation_batches():
+        jobs.append((p["job_name"], p["chunks"], p["provider"]))
+
+    for job_name, word_batches, provider in jobs:
+        logger.info("polling existing generation batch job %s to complete the raw log (read-only, no new requests)...", job_name)
+        final_job = generator.poll_generation_batch_job(job_name, provider, poll_interval_seconds=30)
+        if not generator.is_batch_successful(final_job, provider):
+            logger.error("generation batch job %s did not succeed; some words may be missing this round's data", job_name)
+        results_by_chunk_id = generator.fetch_generation_batch_results(final_job, word_batches, provider)
+        for i in range(len(word_batches)):
+            gen_results = results_by_chunk_id.get(str(i))
+            if gen_results is not None:
+                jsonl_storage.append_jsonl(paths["raw"], gen_results)
+
+    state.clear_pending_generation_batch()
+    for job_name, _, _ in jobs:
+        state.remove_pending_generation_batch(job_name)
     state.clear_pending_generation_batch()
 
 
@@ -426,7 +503,7 @@ def replay_from_raw(config_path: str = "config/config.yaml") -> None:
         state.ensure_word(r)
     state.save()
 
-    _complete_pending_generation_raw_log(state, paths)
+    _complete_pending_generation_raw_log(state, paths, config)
 
     # Reconnect/drain any judge work left over from a prior interrupted run.
     words_to_finalize: dict[int, dict] = {}
@@ -515,6 +592,11 @@ def run(config_path: str = "config/config.yaml") -> None:
     min_passing = config["pipeline"]["min_passing_sentences_per_word"]
     max_rounds = config["pipeline"]["max_generation_rounds"]
     batch_size = config["pipeline"]["batch_size"]
+    # Default is intentionally large (effectively "one job") for backward
+    # compatibility with Gemini-only configs that predate this cap -- Gemini
+    # has handled a full 620-chunk round in one job with no issue.
+    generation_batch_job_max_chunks = config["pipeline"].get("generation_batch_job_max_chunks", 1000)
+    generation_max_concurrent_jobs = config["pipeline"].get("generation_max_concurrent_jobs", 1)
     judge_batch_job_max_chunks = config["pipeline"]["judge_batch_job_max_chunks"]
     judge_max_concurrent_jobs = config["pipeline"].get("judge_max_concurrent_jobs", 1)
     thresholds = config["judge_thresholds"]
@@ -529,35 +611,45 @@ def run(config_path: str = "config/config.yaml") -> None:
     state.save()
 
     # Reconnect to any batch job left in-flight by a previous, interrupted run
-    # instead of silently losing/resubmitting (and double-paying for) it.
-    # Generation reconnects first since judging depends on its output. Words
-    # touched here need finalize_status too (the round loop below only
-    # finalizes words it processed itself), or they'd stay "pending" forever
-    # even once they have enough accepted sentences.
+    # instead of silently losing/resubmitting (and double-paying for) it --
+    # generation queue/pool first (draining it produces judge chunks), then
+    # judge queue/pool. Words touched here need finalize_status too (the
+    # round loop below only finalizes words it processed itself), or they'd
+    # stay "pending" forever even once they have enough accepted sentences.
     words_to_finalize: dict[int, dict] = {}
 
-    pending_gen = state.get_pending_generation_batch()
-    if pending_gen:
-        for batch in pending_gen["chunks"]:
+    for sub_batch in state.get_generation_queue():
+        for chunk in sub_batch:
+            for item in chunk:
+                words_to_finalize.setdefault(item["row_id"], item)
+    for p in state.get_pending_generation_batches():
+        for chunk in p["chunks"]:
+            for item in chunk:
+                words_to_finalize.setdefault(item["row_id"], item)
+    legacy_gen = state.get_pending_generation_batch()
+    if legacy_gen:
+        for batch in legacy_gen["chunks"]:
             for r in batch:
-                words_to_finalize[r["row_id"]] = r
-        judge_chunks = _finish_generation_batch(
-            pending_gen["job_name"], pending_gen["chunks"], state, paths, embedding_model, similarity_threshold,
-        )
-        state.clear_pending_generation_batch()
-        if judge_chunks:
-            sub_batches = list(batching.make_batches(judge_chunks, judge_batch_job_max_chunks))
-            state.set_judge_queue(sub_batches)
+                words_to_finalize.setdefault(r["row_id"], r)
 
-    # Collect row_ids from whatever judge work is queued/in-flight from any
-    # prior run, before draining consumes it.
+    leftover_judge_chunks = _drain_generation_queue(
+        config, prompts_dir, state, paths, embedding_model, similarity_threshold, generation_max_concurrent_jobs,
+    )
+    if leftover_judge_chunks:
+        sub_batches = list(batching.make_batches(leftover_judge_chunks, judge_batch_job_max_chunks))
+        state.set_judge_queue(state.get_judge_queue() + sub_batches)
+
     for sub_batch in state.get_judge_queue():
         for chunk in sub_batch:
             for item in chunk:
                 words_to_finalize.setdefault(item["row_id"], item)
-    pending_judge = state.get_pending_judge_batch()
-    if pending_judge:
-        for chunk in pending_judge["chunks"]:
+    for p in state.get_pending_judge_batches():
+        for chunk in p["chunks"]:
+            for item in chunk:
+                words_to_finalize.setdefault(item["row_id"], item)
+    legacy_judge = state.get_pending_judge_batch()
+    if legacy_judge:
+        for chunk in legacy_judge["chunks"]:
             for item in chunk:
                 words_to_finalize.setdefault(item["row_id"], item)
 
@@ -579,19 +671,22 @@ def run(config_path: str = "config/config.yaml") -> None:
             state.record_round_attempt(r["row_id"])
         word_batches = list(batching.make_batches(pending, batch_size))
 
-        job_name = generator.submit_generation_batch_job(word_batches, config, prompts_dir)
-        state.set_pending_generation_batch(job_name, word_batches)
-        judge_chunks = _finish_generation_batch(
-            job_name, word_batches, state, paths, embedding_model, similarity_threshold,
+        gen_sub_batches = list(batching.make_batches(word_batches, generation_batch_job_max_chunks))
+        logger.info(
+            "round %d: %d word-batch(es) split into %d generation sub-job(s) of <=%d chunks each",
+            round_num, len(word_batches), len(gen_sub_batches), generation_batch_job_max_chunks,
         )
-        state.clear_pending_generation_batch()
+        state.set_generation_queue(gen_sub_batches)
+        judge_chunks = _drain_generation_queue(
+            config, prompts_dir, state, paths, embedding_model, similarity_threshold, generation_max_concurrent_jobs,
+        )
 
         if not judge_chunks:
             logger.info("round %d: nothing survived to judge", round_num)
         else:
             sub_batches = list(batching.make_batches(judge_chunks, judge_batch_job_max_chunks))
             logger.info(
-                "round %d: %d judge chunk(s) split into %d sequential sub-job(s) of <=%d chunks each",
+                "round %d: %d judge chunk(s) split into %d sub-job(s) of <=%d chunks each",
                 round_num, len(judge_chunks), len(sub_batches), judge_batch_job_max_chunks,
             )
             state.set_judge_queue(sub_batches)
@@ -600,6 +695,143 @@ def run(config_path: str = "config/config.yaml") -> None:
         for r in pending:
             state.finalize_status(r["row_id"], min_passing, max_rounds)
         state.save()
+
+    export_final(all_records, state, paths)
+    logger.info("pipeline complete: %s", state.summary())
+
+
+def _process_word_batch_synchronously(
+    batch: list[dict],
+    config: dict,
+    prompts_dir: str,
+    state: PipelineState,
+    paths: dict,
+    embedding_model: str,
+    similarity_threshold: float,
+    thresholds: dict,
+    min_passing: int,
+    max_rounds: int,
+    state_lock: threading.Lock,
+) -> None:
+    """Runs one word-batch fully through generate -> validate/dedup -> judge
+    -> apply, entirely via synchronous (non-batch-API) calls. Used when a
+    provider's async Batch API is unavailable -- no per-provider token-cap
+    concerns apply since there's no batch job to size.
+
+    Safe to call from multiple threads concurrently: all reads/writes of
+    `state` are serialized via `state_lock`, while the slow network calls
+    (generate_batch/judge_batch) run without holding it, so threads overlap
+    during the actual waiting."""
+    row_ids = [r["row_id"] for r in batch]
+    try:
+        gen_results = generator.generate_batch(batch, config, prompts_dir)
+    except Exception:
+        logger.exception("synchronous generation failed for row_ids=%s; leaving pending for another round", row_ids)
+        return
+
+    with state_lock:
+        judge_chunk = _process_generation_results(
+            batch, gen_results, state, paths, embedding_model, similarity_threshold,
+        )
+
+    if not judge_chunk:
+        logger.info("nothing survived to judge for row_ids=%s", row_ids)
+        return
+
+    try:
+        judge_results = judge.judge_batch(judge_chunk, config, prompts_dir)
+    except Exception:
+        logger.exception("synchronous judging failed for row_ids=%s; leaving pending for another round", row_ids)
+        return
+
+    with state_lock:
+        _apply_judge_results(
+            [judge_chunk], {"chunk-0": judge_results}, state, paths, thresholds, min_passing, max_rounds,
+        )
+
+
+def run_synchronous(config_path: str = "config/config.yaml", max_workers: int | None = None) -> None:
+    """Fallback execution mode for when a provider's async Batch API is
+    unavailable (e.g. the OpenAI Batch API file-access outage encountered on
+    2026-08-31, confirmed account-wide and unrelated to this codebase):
+    processes every pending word-batch via plain synchronous calls
+    (generator.generate_batch / judge.judge_batch), a handful at a time via a
+    thread pool since these are independent, I/O-bound HTTP calls. No batch
+    jobs, no queues, no token-cap concerns -- just N workers making regular
+    API calls. Costs full price (no ~50% batch discount) in exchange for
+    working regardless of Batch API availability.
+    """
+    load_dotenv(os.path.join(_PROJECT_ROOT, ".env"))
+    config = load_config(config_path)
+    setup_logging(config)
+
+    paths = {
+        "raw": os.path.join(config["paths"]["data_raw"], "generated.jsonl"),
+        "processed": os.path.join(config["paths"]["data_processed"], "judged.jsonl"),
+        "rejected": os.path.join(config["paths"]["data_rejected"], "rejected.jsonl"),
+        "data_final": config["paths"]["data_final"],
+        "logs_dir": config["paths"]["logs_dir"],
+    }
+    prompts_dir = config["paths"]["prompts_dir"]
+    embedding_model = config["llm"]["embedding"]["model"]
+    similarity_threshold = config["pipeline"]["near_duplicate_similarity_threshold"]
+    min_passing = config["pipeline"]["min_passing_sentences_per_word"]
+    max_rounds = config["pipeline"]["max_generation_rounds"]
+    batch_size = config["pipeline"]["batch_size"]
+    thresholds = config["judge_thresholds"]
+    if max_workers is None:
+        max_workers = config["pipeline"].get("sync_max_workers", 5)
+
+    logger.info("loading input words from %s", config["paths"]["input_file"])
+    all_records = excel_storage.read_words(config["paths"]["input_file"])
+    logger.info("loaded %d words", len(all_records))
+
+    state = PipelineState(config["paths"]["state_file"])
+    for r in all_records:
+        state.ensure_word(r)
+    state.save()
+
+    state_lock = threading.Lock()
+
+    for round_num in range(1, max_rounds + 1):
+        with state_lock:
+            pending = state.words_needing_round(all_records, min_passing)
+        if not pending:
+            logger.info("all words satisfied after round %d", round_num - 1)
+            break
+
+        logger.info("round %d/%d (synchronous): %d word(s) need (more) sentences", round_num, max_rounds, len(pending))
+        with state_lock:
+            for r in pending:
+                state.record_round_attempt(r["row_id"])
+            state.save()
+        word_batches = list(batching.make_batches(pending, batch_size))
+        logger.info("round %d: %d word-batch(es), %d worker(s)", round_num, len(word_batches), max_workers)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {
+                pool.submit(
+                    _process_word_batch_synchronously,
+                    batch, config, prompts_dir, state, paths, embedding_model, similarity_threshold,
+                    thresholds, min_passing, max_rounds, state_lock,
+                ): batch
+                for batch in word_batches
+            }
+            done_count = 0
+            for future in as_completed(futures):
+                done_count += 1
+                batch = futures[future]
+                try:
+                    future.result()
+                except Exception:
+                    logger.exception("worker crashed for row_ids=%s", [r["row_id"] for r in batch])
+                if done_count % 10 == 0 or done_count == len(word_batches):
+                    logger.info("round %d: %d/%d word-batch(es) done", round_num, done_count, len(word_batches))
+
+        with state_lock:
+            for r in pending:
+                state.finalize_status(r["row_id"], min_passing, max_rounds)
+            state.save()
 
     export_final(all_records, state, paths)
     logger.info("pipeline complete: %s", state.summary())

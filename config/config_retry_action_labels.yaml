@@ -80,7 +80,7 @@ pipeline:
 
 paths:
   input_file: input/merged_dataset_total_words.csv
-  prompts_dir: prompts
+  prompts_dir: prompts_retry
   data_raw: data/raw
   data_processed: data/processed
   data_rejected: data/rejected

@@ -84,6 +84,16 @@ class PipelineState:
     def all_entries(self) -> list[dict]:
         return list(self._data["words"].values())
 
+    def reset_word_for_retry(self, row_id: int) -> None:
+        """Gives an "exhausted" word a fresh set of attempts (e.g. after
+        switching to a different/newly-funded generation provider). Keeps
+        whatever sentences it already accepted -- only status and the round
+        counter reset, so it's re-eligible for words_needing_round() without
+        losing prior progress."""
+        entry = self._data["words"][str(row_id)]
+        entry["status"] = "pending"
+        entry["rounds_attempted"] = 0
+
     def set_pending_judge_batch(self, batch_id: str, chunks: list[list[dict]], provider: str) -> None:
         """Legacy single-job form, kept only so old state.json files (and any
         live job already tracked this way) still parse; see
@@ -162,6 +172,52 @@ class PipelineState:
 
     def clear_judge_queue(self) -> None:
         self._data.pop("judge_queue", None)
+        self.save()
+
+    def add_pending_generation_batch(self, job_name: str, chunks: list[list[dict]], provider: str) -> None:
+        """Persist one in-flight generation batch job (of possibly several
+        running concurrently) so a restart can reconnect and poll/apply it
+        instead of resubmitting (and double-paying for) the same work.
+        Mirrors add_pending_judge_batch -- see there for why `provider` is
+        stored alongside."""
+        pending = self._data.setdefault("pending_generation_batches", [])
+        pending.append({"job_name": job_name, "chunks": chunks, "provider": provider})
+        self.save()
+
+    def get_pending_generation_batches(self) -> list[dict]:
+        return self._data.get("pending_generation_batches", [])
+
+    def remove_pending_generation_batch(self, job_name: str) -> None:
+        pending = self._data.get("pending_generation_batches", [])
+        self._data["pending_generation_batches"] = [p for p in pending if p["job_name"] != job_name]
+        self.save()
+
+    def set_generation_queue(self, sub_batches: list[list[list[dict]]]) -> None:
+        """Persist the full list of not-yet-submitted generation sub-batches
+        for the current round. Mirrors set_judge_queue."""
+        self._data["generation_queue"] = sub_batches
+        self.save()
+
+    def get_generation_queue(self) -> list[list[list[dict]]]:
+        return self._data.get("generation_queue", [])
+
+    def pop_generation_queue_item(self) -> list[list[dict]] | None:
+        queue = self._data.get("generation_queue", [])
+        if not queue:
+            return None
+        item = queue.pop(0)
+        self._data["generation_queue"] = queue
+        self.save()
+        return item
+
+    def push_generation_queue_item_front(self, sub_batch: list[list[dict]]) -> None:
+        queue = self._data.get("generation_queue", [])
+        queue.insert(0, sub_batch)
+        self._data["generation_queue"] = queue
+        self.save()
+
+    def clear_generation_queue(self) -> None:
+        self._data.pop("generation_queue", None)
         self.save()
 
     def summary(self) -> dict:

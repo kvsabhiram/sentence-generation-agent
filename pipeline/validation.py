@@ -29,8 +29,25 @@ DIMENSION_KEYS = [
 ]
 
 
+def _is_word_char(ch: str) -> bool:
+    return bool(re.match(r"\w", ch, re.UNICODE))
+
+
 def _word_pattern(word: str) -> re.Pattern:
-    return re.compile(r"\b" + re.escape(word.strip()) + r"\b", re.IGNORECASE)
+    """\\b requires an actual word/non-word transition on BOTH sides, which
+    silently fails to match when the target word itself starts/ends in
+    punctuation next to other punctuation in the sentence (e.g. target word
+    "Really?" inside `...said, "Really?"` -- "?" and the closing quote are
+    both non-word chars, so no \\b exists between them even though the word
+    is clearly present). Only assert a non-word-char boundary on a given
+    side when that side of the target word is itself a word character --
+    that's the only side where a false "substring of a longer word" match
+    (e.g. "Store" inside "Stores") is even possible."""
+    w = word.strip()
+    escaped = re.escape(w)
+    prefix = r"(?<!\w)" if _is_word_char(w[0]) else ""
+    suffix = r"(?!\w)" if _is_word_char(w[-1]) else ""
+    return re.compile(prefix + escaped + suffix, re.IGNORECASE)
 
 
 def contains_target_word(sentence: str, word: str) -> bool:

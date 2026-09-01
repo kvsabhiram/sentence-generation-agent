@@ -1,0 +1,366 @@
+================================================================================
+SYNTHETIC SENTENCE GENERATION PIPELINE -- FLOW RECORD
+Project: Sentence_Generation_Agent
+Prepared for record/reference purposes
+================================================================================
+
+
+================================================================================
+1. WHAT THE ORIGINAL PROMPTS SPECIFIED (prompts/generator.txt + prompts/judge.txt)
+================================================================================
+
+These two prompt files were the ORIGINAL spec. They never changed during the
+project -- everything below in section 2/3 was built AROUND them, not instead
+of them. The flow implied by reading them alone, with no extra engineering,
+would have been:
+
+  1. For each (row_id, domain, category, word) input row, send a batch of
+     records to an LLM with generator.txt as the system prompt.
+  2. LLM returns 4-5 sentences per word as JSON, each with a sentence_id and
+     a claimed "context" tag.
+  3. Send the generated sentences to a (possibly different) LLM with
+     judge.txt as the system prompt.
+  4. LLM scores each sentence on 7 dimensions (target_usage, grammar,
+     naturalness, domain_relevance, category_relevance, context_quality,
+     training_usefulness), computes its own overall_score, and outputs its
+     own decision: PASS or FAIL.
+  5. Keep whatever the judge marked PASS.
+
+Notably, the prompts by themselves leave several things unspecified /
+delegated entirely to the LLM's judgment:
+  - Whether the target word is actually present in the sentence (trusted to
+    the generator's claim).
+  - Whether a sentence is a near-duplicate of another (trusted to the judge's
+    own "reject if duplicate" instruction -- no independent check).
+  - Whether PASS/FAIL is applied consistently (trusted to the judge's own
+    arithmetic and threshold comparison against the thresholds written into
+    its own prompt).
+  - What happens if a word ends up with fewer than 3-4 good sentences after
+    judging (not addressed at all -- no retry/backfill concept).
+  - Which underlying LLM provider/model to use, or what to do if that
+    provider's account runs out of credits mid-project.
+  - How to handle 15,490 words' worth of API calls without hitting per-job
+    provider limits (token caps, rate limits) or paying full synchronous
+    price when a cheaper async batch discount is available.
+  - How to survive an interruption (crash, session restart, multi-hour
+    runtime) without losing completed work and restarting from zero.
+
+
+================================================================================
+2. THE FLOW WE ACTUALLY BUILT AND RAN
+================================================================================
+
+The prompts above are still used VERBATIM as the system prompts for the
+generator and judge LLM calls -- that part never changed. Everything else
+below is the engineering layer built around them to make the project
+actually work at 15,490-word scale, survive two providers running out of
+credit, and produce a dataset we could trust without taking the LLMs' own
+self-reported verdicts at face value.
+
+--------------------------------------------------------------------------
+2.1  High-level pipeline (per word, per round)
+--------------------------------------------------------------------------
+
+  input/merged_dataset_total_words.csv (15,490 rows: Domain, Category, Word)
+        |
+        v
+  [1] BATCH   -- pipeline/batching.py groups words into fixed-size chunks
+        |         (batch_size in config.yaml)
+        v
+  [2] GENERATE -- agents/generator.py sends each chunk to the generator LLM
+        |          using prompts/generator.txt verbatim, asking for 5
+        |          sentences/word (sentences_requested_per_word)
+        v
+  [3] STRUCTURAL VALIDATION (pipeline/validation.py, LOCAL, no LLM call)
+        |          - reject empty sentences
+        |          - reject sentences where the target word is NOT present,
+        |            using a literal, case-insensitive, WORD-BOUNDARY regex
+        |            match (\bword\b) -- NOT trusting the generator's own
+        |            claim of correct usage, and NOT doing any
+        |            stemming/lemmatizing (e.g. "Store" matches "store" but
+        |            not "Stores"/"storing"; multi-word phrases like
+        |            "Drop Off" are matched as a literal phrase)
+        v
+  [4] NEAR-DUPLICATE REJECTION (embedding/*, LOCAL GPU, no LLM/API call)
+        |          - every surviving candidate is embedded with a local
+        |            sentence-transformers model (all-MiniLM-L6-v2) running
+        |            on the RTX 4070 SUPER via CUDA
+        |          - cosine similarity is checked against (a) every other
+        |            candidate in this batch and (b) every sentence already
+        |            ACCEPTED for this word in earlier rounds/attempts
+        |            (persisted in state.json, not just the current batch)
+        |          - similarity >= near_duplicate_similarity_threshold
+        |            (0.92) => rejected, regardless of what the judge LLM
+        |            might have said about it
+        |          - this embedding module is the SOLE authority on
+        |            duplicates; the judge LLM is also asked to flag
+        |            duplicates per judge.txt, but that opinion is logged
+        |            only and never acted on
+        v
+  [5] JUDGE -- agents/judge.py sends surviving candidates to the judge LLM
+        |       using prompts/judge.txt verbatim, which returns 7
+        |       per-dimension scores per sentence (its own overall_score
+        |       and decision are also returned but NOT trusted, see next
+        |       step)
+        v
+  [6] DETERMINISTIC DECISION (pipeline/validation.py::compute_decision,
+        |       LOCAL, no LLM call)
+        |          - overall_score is RECOMPUTED locally as the plain mean
+        |            of the 7 dimension scores (not read from the judge's
+        |            own arithmetic)
+        |          - PASS/FAIL is RECOMPUTED locally by comparing each of
+        |            the 7 scores against config.yaml's judge_thresholds
+        |            (target_usage>=0.90, grammar>=0.85, naturalness>=0.85,
+        |            domain_relevance>=0.80, category_relevance>=0.80,
+        |            context_quality>=0.80, training_usefulness>=0.85) --
+        |            ALL must pass, or the sentence is FAIL, regardless of
+        |            what the judge LLM's own "decision" field said
+        v
+  [7] ACCUMULATE -- accepted sentences are appended to that word's record in
+        |            pipeline/state.py's persistent state (data/state.json),
+        |            together with their embeddings (so future rounds can
+        |            dedup against them without re-embedding)
+        v
+  [8] BACKFILL CHECK -- if a word now has >= min_passing_sentences_per_word
+        |               (3), it is marked "complete" and excluded from
+        |               future rounds. If not, and rounds_attempted <
+        |               max_generation_rounds (3), it goes back into the
+        |               queue for another generation+judge round (a fresh
+        |               request for more candidates, still deduped against
+        |               everything already accepted). If it runs out of
+        |               rounds still short of 3, it is marked "exhausted".
+        v
+  [9] EXPORT -- storage/jsonl.py + storage/excel.py write every accepted
+                sentence across all words to data/final/final_sentences.jsonl
+                and .xlsx
+
+This 9-step flow is common to every mode the pipeline can run in (batch,
+sync, replay -- see 2.4). The difference between modes is only HOW steps
+2 and 5 talk to the LLM provider, and whether step 2 is skipped entirely.
+
+--------------------------------------------------------------------------
+2.2  Provider-switchable generation and judging (config/config.yaml)
+--------------------------------------------------------------------------
+
+Both the generator and the judge are dispatched through a thin router:
+
+    agents/generator.py  -> agents/generator_gemini.py  or
+                             agents/generator_openai.py
+    agents/judge.py      -> agents/judge_gemini.py       or
+                             agents/judge_openai.py
+
+which provider each agent uses is controlled purely by config.yaml
+(llm.generator.provider / llm.judge.provider: "gemini" | "openai") --
+no code changes needed to switch. This was required because Gemini and
+OpenAI credits ran out at different, unpredictable points during the
+project, and generation/judging needed to keep running on whichever
+provider still had balance, independently of each other (e.g. at one point
+generation ran on Gemini while judging ran on OpenAI).
+
+--------------------------------------------------------------------------
+2.3  Async Batch API usage (cost control)
+--------------------------------------------------------------------------
+
+Per an explicit instruction to use each provider's Batch API wherever
+feasible (roughly half the synchronous price):
+  - Gemini: client.batches.create(...) + polling client.batches.get(...)
+  - OpenAI: client.files.create(purpose="batch") + client.batches.create(...)
+            + polling client.batches.retrieve(...)
+
+Both providers cap how many tokens a single batch job may reserve at once
+(OpenAI enforces a hard 2,000,000 enqueued-token org-wide cap that rejects
+an oversized job outright, not partially). To work within this at
+15,490-word scale, the pipeline runs a POOL of up to N batch jobs
+concurrently (judge_max_concurrent_jobs / generation_max_concurrent_jobs),
+refilling from a queue as jobs finish, sized so the pool's combined
+reserved tokens stay safely under the cap. This logic
+(pipeline/orchestrator.py: _drain_judge_queue / _drain_generation_queue)
+is identical in shape for both generation and judging.
+
+--------------------------------------------------------------------------
+2.4  Three ways to run the pipeline (main.py)
+--------------------------------------------------------------------------
+
+  python main.py                 Normal run: full 9-step flow above using
+                                  each provider's async Batch API.
+
+  python main.py --replay        Skip generation entirely. Reuse whatever
+                                  raw generator output already exists on
+                                  disk from earlier attempts (merging a
+                                  word's candidates across every prior
+                                  attempt/provider), and run only
+                                  steps 3-9 (validate, dedup, judge,
+                                  accumulate, backfill, export) against
+                                  that existing pool. Built specifically to
+                                  avoid spending new generation credits
+                                  when two earlier raw-generation datasets
+                                  already existed unused. Words still short
+                                  afterward are left "pending" for a normal
+                                  run later.
+
+  python main.py --sync          Same 9-step flow, but steps 2 and 5 use
+                                  plain synchronous API calls (a
+                                  ThreadPoolExecutor of sync_max_workers
+                                  workers) instead of the async Batch API.
+                                  Built as a fallback for when OpenAI's
+                                  Batch API had an account-wide outage
+                                  (confirmed via 7 independent failing test
+                                  jobs, not a code bug) -- costs full price
+                                  instead of the batch discount, but has no
+                                  dependency on batch job infrastructure at
+                                  all.
+
+--------------------------------------------------------------------------
+2.5  Resumability (pipeline/state.py, data/state.json)
+--------------------------------------------------------------------------
+
+Every word's status ("pending" / "complete" / "exhausted"), its accepted
+sentences (with embeddings), and its rounds_attempted count are checkpointed
+to data/state.json after every phase, using atomic writes (temp file +
+os.replace) so a crash mid-write can't corrupt it. In-flight batch job IDs
+and queues are also persisted, so if the process is killed or the machine
+restarts mid-run, re-launching main.py picks up exactly where it left off
+instead of re-processing already-completed words or re-submitting
+already-running batch jobs. This mattered because multi-hour real runs were
+repeatedly interrupted by session/harness restarts; long real runs were
+ultimately launched as detached OS processes (nohup ... & disown) writing to
+a log file, specifically so they would survive those restarts.
+
+
+================================================================================
+3. ORIGINAL FLOW vs. PRESENT FLOW -- SIDE BY SIDE
+================================================================================
+
+  DECISION POINT              ORIGINAL PROMPT-ONLY FLOW    PRESENT FLOW
+  ---------------------------  ---------------------------  --------------------------------
+  Target word present?         Trusted to generator's        Re-checked locally: literal,
+                                own claim                     case-insensitive, word-boundary
+                                                               regex match. No stemming.
+
+  Duplicate sentences?         Trusted to judge LLM's own     Sole authority is a local GPU
+                                "reject if duplicate"          embedding model (MiniLM),
+                                instinct, per-request only     cosine similarity >= 0.92,
+                                (no cross-round memory)        checked against the word's FULL
+                                                                accepted history across every
+                                                                round/attempt. Judge LLM's own
+                                                                duplicate opinion is logged
+                                                                only, never acted on.
+
+  PASS/FAIL decision?          Judge LLM's own arithmetic     Recomputed locally from the same
+                                and self-reported decision     7 per-dimension scores against
+                                field, trusted as-is           config.yaml's thresholds -- ALL
+                                                                7 must clear their threshold.
+                                                                Judge's own decision/
+                                                                overall_score logged for audit
+                                                                only.
+
+  Word short of quota?         Not addressed                  Automatic backfill: re-queued
+                                                                for up to max_generation_rounds
+                                                                (3) rounds, deduped against
+                                                                everything already accepted,
+                                                                until >=3 accepted or rounds
+                                                                exhausted.
+
+  LLM provider                 Not addressed                  Fully switchable per-agent via
+                                                                config.yaml (Gemini <-> OpenAI),
+                                                                no code changes, because both
+                                                                providers ran out of credit at
+                                                                different points.
+
+  API cost                     Not addressed                  Async Batch API used wherever
+                                                                available (~50% cheaper),
+                                                                pooled/queued to stay under
+                                                                provider token caps; synchronous
+                                                                fallback only when a provider's
+                                                                Batch API was down.
+
+  Interruption/crash           Not addressed                  Full resumable state
+                                                                (data/state.json, atomic
+                                                                writes); detached background
+                                                                processes for long runs.
+
+  Reusing prior LLM output      Not addressed                  --replay mode: merge and judge
+                                                                existing raw generation output
+                                                                from earlier attempts before
+                                                                spending on any new generation.
+
+
+================================================================================
+4. FINAL CONFIGURATION IN USE (config/config.yaml, as of pipeline completion)
+================================================================================
+
+  Generator: provider=openai, model=gpt-5.6-luna, max_output_tokens=16384
+  Judge:     provider=openai, model=gpt-5.6-luna, max_output_tokens=32768
+  Embedding: local sentence-transformers/all-MiniLM-L6-v2 (GPU)
+
+  batch_size: 25
+  sentences_requested_per_word: 5
+  min_passing_sentences_per_word: 3
+  max_generation_rounds: 3
+  near_duplicate_similarity_threshold: 0.92
+  judge_batch_job_max_chunks: 14 / judge_max_concurrent_jobs: 2
+  generation_batch_job_max_chunks: 30 / generation_max_concurrent_jobs: 2
+  sync_max_workers: 5
+
+  judge_thresholds: target_usage>=0.90, grammar>=0.85, naturalness>=0.85,
+                     domain_relevance>=0.80, category_relevance>=0.80,
+                     context_quality>=0.80, training_usefulness>=0.85
+
+  (Both Gemini keys, GEMINI_API_KEY and GEMINI_JUDGE_API_KEY, ran out of
+  prepayment credit during the project; OpenAI's OPEN_AI_API_KEY was the
+  working key used for the final runs.)
+
+
+================================================================================
+5. FINAL DATASET RESULT
+================================================================================
+
+  Input words:              15,490  (Domain, Category, Word; ~58% multi-word phrases)
+  Words complete (>=3 accepted, all thresholds met, deduped): 15,017
+  Words exhausted (never reached 3 after 3 rounds):             473
+  Word coverage:                                              96.9%
+  Total accepted sentences exported:                        156,752
+
+  Output files:
+    data/final/final_sentences.jsonl
+    data/final/final_sentences.xlsx
+
+  Each output sentence carries: row_id, domain, category, word, sentence_id,
+  sentence text, context tag, and the 7 judge dimension scores plus the
+  locally-recomputed overall_score/decision.
+
+
+================================================================================
+6. KEY FILES REFERENCE
+================================================================================
+
+  prompts/generator.txt        Verbatim generator system prompt (unchanged)
+  prompts/judge.txt            Verbatim judge system prompt (unchanged)
+  config/config.yaml           All tunables: providers, models, thresholds,
+                                batch sizing, paths
+  main.py                      CLI entrypoint (--replay / --sync / default)
+  agents/generator.py          Provider dispatcher for generation
+  agents/generator_gemini.py   Gemini generation implementation
+  agents/generator_openai.py   OpenAI generation implementation
+  agents/judge.py              Provider dispatcher for judging
+  agents/judge_gemini.py       Gemini judging implementation
+  agents/judge_openai.py       OpenAI judging implementation
+  pipeline/orchestrator.py     Core end-to-end flow (run / run_synchronous /
+                                replay_from_raw + batch job queue management)
+  pipeline/validation.py       Word-boundary match + deterministic PASS/FAIL
+  pipeline/state.py            Resumable per-word state (data/state.json)
+  pipeline/batching.py         Chunking words into fixed-size batches
+  embedding/model.py           Local GPU sentence-transformers embedding
+  embedding/similarity.py      Cosine-similarity near-duplicate authority
+  storage/jsonl.py             .jsonl export
+  storage/excel.py             .xlsx export
+  data/state.json              Live resumable pipeline state (~15.5k words)
+  data/final/final_sentences.*  Final deliverable dataset
+  logs/pipeline.log            Main run log
+  logs/sync_run.log            Log for the final --sync run (4,698-word
+                                backfill pass that brought coverage from
+                                10,792 to 15,017 complete words)
+
+================================================================================
+END OF RECORD
+================================================================================
